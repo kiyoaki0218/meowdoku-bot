@@ -96,21 +96,63 @@ def upload_to_imgur(image_bytes):
 
 
 # ==========================================
-# 2. 画像解析 (PIL + NumPy)
+# 2. 精密な盤面枠自動検出 (カラフルピクセル分析)
+# ==========================================
+def find_board_bounds(img_np):
+    """
+    パズル盤面のカラフルな領域の正確なバウンディングボックス (bx, by, bw, bh) を検出
+    """
+    h, w, _ = img_np.shape
+    
+    # 彩度判定 (RGBの最大値と最小値の差が大きいピクセル＝パズルの色マス)
+    r = img_np[..., 0].astype(int)
+    g = img_np[..., 1].astype(int)
+    b = img_np[..., 2].astype(int)
+    
+    color_diff = np.maximum(np.maximum(np.abs(r - g), np.abs(g - b)), np.abs(b - r))
+    
+    # 明らかな色がついているピクセル (彩度 > 25)
+    colored_mask = color_diff > 25
+
+    # 画像の上部・下部のUI領域（アイコン等）を除外するため、Y範囲を20%〜80%に限定
+    y_min_limit = int(h * 0.20)
+    y_max_limit = int(h * 0.82)
+    colored_mask[:y_min_limit, :] = False
+    colored_mask[y_max_limit:, :] = False
+
+    y_indices, x_indices = np.where(colored_mask)
+
+    if len(y_indices) > 0 and len(x_indices) > 0:
+        bx = int(np.min(x_indices))
+        by = int(np.min(y_indices))
+        bw = int(np.max(x_indices) - bx)
+        bh = int(np.max(y_indices) - by)
+        
+        # 正方形に近づける微調整
+        side = max(bw, bh)
+        return bx, by, side, side
+
+    # 万が一検出失敗した場合のバックアップ推定
+    bw = int(w * 0.9)
+    bh = bw
+    bx = int((w - bw) / 2)
+    by = int(h * 0.31) # 盤面の平均的な開始位置
+    return bx, by, bw, bh
+
+
+# ==========================================
+# 3. 画像解析 (PIL + NumPy)
 # ==========================================
 def process_puzzle_image(image_bytes):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
     img_np = np.array(img)
 
-    # 中央の盤面エリアをクロップ (画像中央の88%領域)
-    bw = int(w * 0.88)
-    bh = bw
-    bx = int((w - bw) / 2)
-    by = int((h - bh) / 2)
+    # 1. 精密な盤面枠の検出
+    bx, by, bw, bh = find_board_bounds(img_np)
 
-    # 10x10 または 9x9 を判定・探索
-    for N in [10, 9]:
+    # 2. 9x9 または 10x10 の判定と解法
+    for N in [9, 10]:
         cell_w = bw / N
         cell_h = bh / N
         colors_samples = []
@@ -140,11 +182,12 @@ def process_puzzle_image(image_bytes):
                         cat_coords.append((r + 1, c + 1))
                         cx = bx + (c + 0.5) * cell_w
                         cy = by + (r + 0.5) * cell_h
-                        rad = min(cell_w, cell_h) * 0.35
-                        # 赤丸の描画
-                        draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=6)
-                        draw.ellipse([cx - rad*0.4, cy - rad*0.4, cx + rad*0.4, cy + rad*0.4], fill="red")
-            
+                        rad = min(cell_w, cell_h) * 0.38
+                        
+                        # 太い赤色の二重丸を中心ピッタリに描画
+                        draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=7)
+                        draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="red")
+
             # 画像をバイト列に変換
             out_buffer = io.BytesIO()
             img.save(out_buffer, format="JPEG", quality=85)
@@ -159,7 +202,7 @@ def process_puzzle_image(image_bytes):
 
 
 # ==========================================
-# 3. Webhook エンドポイント
+# 4. Webhook エンドポイント
 # ==========================================
 @app.route("/", methods=['GET'])
 def index():
@@ -177,7 +220,7 @@ def callback():
 
 
 # ==========================================
-# 4. LINE メッセージ処理
+# 5. LINE メッセージ処理
 # ==========================================
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
@@ -198,7 +241,7 @@ def handle_image_message(event):
             coord_text += "\n".join([f"・{r}行目 - {c}列目" for r, c in cat_coords])
             messages.append(TextMessage(text=coord_text))
 
-            # 2. 画像メッセージ (URLが取得できている場合)
+            # 2. 画像メッセージ (公開URL)
             if image_url:
                 messages.append(ImageMessage(
                     original_content_url=image_url,

@@ -81,11 +81,11 @@ def solve_meowdoku(grid):
     return None
 
 
-# 無料画像ホスティングへのアップロード（完全にユニークなファイル名でキャッシュ回避）
+# 無料画像ホスティングへのアップロード
 def upload_image_to_cloud(image_bytes):
     unique_name = f"solution_{uuid.uuid4().hex}.jpg"
     
-    # 1. Catbox.moe 無料無制限アップロード
+    # 1. Catbox.moe
     try:
         url = "https://catbox.moe/user/api.php"
         files = {'fileToUpload': (unique_name, image_bytes, 'image/jpeg')}
@@ -96,7 +96,7 @@ def upload_image_to_cloud(image_bytes):
     except Exception as e:
         logging.error(f"Catbox upload failed: {e}")
 
-    # 2. Imgur 無料アップロード
+    # 2. Imgur
     try:
         url = "https://api.imgur.com/3/image"
         headers = {"Authorization": "Client-ID 5442646d79e5d9c"}
@@ -112,146 +112,126 @@ def upload_image_to_cloud(image_bytes):
 
 
 # ==========================================
-# 2. オンデマンド・フルカラー盤面描画
+# 2. 精密な白枠ベースの盤面位置検出
 # ==========================================
-@app.route("/render_solution")
-def render_solution():
+def find_board_precise(img_np):
     """
-    元のゲーム画面の色付け（カラフルなマス目）を忠実に再現したパズル解答画像を生成
+    白背景枠（外枠の角丸長方形）をピクセル検索して1ピクセルの狂いもなく検出
     """
-    try:
-        cats_param = request.args.get("cats", "")
-        colors_param = request.args.get("colors", "")
-        N = int(request.args.get("N", 9))
+    h, w, _ = img_np.shape
+    
+    # 画像のY方向 20% 〜 85% のエリアを対象にする（ダイナミックアイランドや下部ボタンを除外）
+    y_start = int(h * 0.20)
+    y_end = int(h * 0.85)
+    
+    # 白背景領域 (RGBが全て240以上)
+    is_white = (img_np[y_start:y_end, :, 0] > 240) & \
+               (img_np[y_start:y_end, :, 1] > 240) & \
+               (img_np[y_start:y_end, :, 2] > 240)
+               
+    # 各行・各列の白ピクセル数の分布から枠の端を検索
+    row_counts = is_white.sum(axis=1)
+    col_counts = is_white.sum(axis=0)
+    
+    # 幅の大部分が白背景である行
+    valid_rows = np.where(row_counts > w * 0.7)[0]
+    valid_cols = np.where(col_counts > (y_end - y_start) * 0.4)[0]
+    
+    if len(valid_rows) > 0 and len(valid_cols) > 0:
+        by1 = y_start + valid_rows[0]
+        by2 = y_start + valid_rows[-1]
+        bx1 = valid_cols[0]
+        bx2 = valid_cols[-1]
         
-        coords = set(tuple(map(int, p.split("_"))) for p in cats_param.split(",") if p)
-        color_list = [list(map(int, c.split("_"))) for c in colors_param.split("-") if c]
+        bw = bx2 - bx1
+        bh = by2 - by1
         
-        img_size = 640
-        padding = 20
-        board_size = img_size - padding * 2
-        cell_size = board_size / N
+        # 内側のグリッド位置（白枠の内側余白を約3%除外）
+        margin_x = int(bw * 0.025)
+        margin_y = int(bh * 0.025)
         
-        img = Image.new("RGB", (img_size, img_size), "#F7F4EF")
-        draw = ImageDraw.Draw(img)
+        grid_x = bx1 + margin_x
+        grid_y = by1 + margin_y
+        grid_w = bw - (margin_x * 2)
+        grid_h = bh - (margin_y * 2)
         
-        # 各マスのカラフルな色ブロックを角丸で描画
-        for r in range(N):
-            for c in range(N):
-                idx = r * N + c
-                if idx < len(color_list):
-                    rgb = tuple(color_list[idx])
-                else:
-                    rgb = (200, 200, 200)
-                    
-                x1 = padding + c * cell_size + 2
-                y1 = padding + r * cell_size + 2
-                x2 = padding + (c + 1) * cell_size - 2
-                y2 = padding + (r + 1) * cell_size - 2
-                
-                draw.rounded_rectangle([x1, y1, x2, y2], radius=6, fill=rgb)
-                
-        # 赤丸（ネコの位置）の描画
-        for r, c in coords:
-            r_idx = r - 1
-            c_idx = c - 1
-            cx = padding + (c_idx + 0.5) * cell_size
-            cy = padding + (r_idx + 0.5) * cell_size
-            rad = cell_size * 0.36
-            
-            draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=7)
-            draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="#E60012")
-            
-        out_buf = io.BytesIO()
-        img.save(out_buf, "JPEG", quality=90)
-        out_buf.seek(0)
-        return send_file(out_buf, mimetype="image/jpeg")
-    except Exception as e:
-        logging.error(f"Render solution failed: {e}")
-        return "Error", 500
+        return grid_x, grid_y, grid_w, grid_h
+
+    # 万が一失敗した場合の代替位置
+    bw = int(w * 0.885)
+    bx = int((w - bw) / 2)
+    by = int(h * 0.312)
+    return bx, by, bw, bw
 
 
 # ==========================================
-# 3. 画像解析 (PIL + NumPy)
+# 3. 画像解析 (元のスクリーンショットへの直接描画)
 # ==========================================
-def process_puzzle_image(image_bytes, host_url):
+def process_puzzle_image(image_bytes):
+    # 元のスクリーンショットをそのまま読み込む
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
     img_np = np.array(img)
 
-    bw = int(w * 0.885)
-    bh = bw
-    bx = int((w - bw) / 2)
-    y_offsets = [int(h * 0.313), int(h * 0.310), int(h * 0.316), int(h * 0.305), int(h * 0.320)]
+    # 精密な盤面枠の検出
+    bx, by, bw, bh = find_board_precise(img_np)
 
-    for by in y_offsets:
-        for N in [9, 10]:
-            cell_w = bw / N
-            cell_h = bh / N
-            colors_samples = []
+    # 9x9 または 10x10 の判定
+    for N in [9, 10]:
+        cell_w = bw / N
+        cell_h = bh / N
+        colors_samples = []
 
-            for r in range(N):
-                row_samples = []
-                for c in range(N):
-                    cx = int(bx + (c + 0.5) * cell_w)
-                    cy = int(by + (r + 0.5) * cell_h)
-                    patch = img_np[max(0, cy-3):min(h, cy+4), max(0, cx-3):min(w, cx+4)]
-                    mean_rgb = patch.mean(axis=(0, 1))
-                    row_samples.append(mean_rgb)
-                colors_samples.append(row_samples)
-
-            flat_samples = np.array(colors_samples).reshape(-1, 3)
-            kmeans = KMeans(n_clusters=N, random_state=42, n_init=10).fit(flat_samples)
-            labels = kmeans.labels_.reshape(N, N)
-
-            solution = solve_meowdoku(labels)
-            if solution is not None:
-                cluster_colors = {}
-                for k in range(N):
-                    cluster_colors[k] = kmeans.cluster_centers_[k].astype(int)
-
-                cell_rgb_strings = []
-                draw = ImageDraw.Draw(img)
-                cat_coords = []
-                coords_param_list = []
+        for r in range(N):
+            row_samples = []
+            for c in range(N):
+                cx = int(bx + (c + 0.5) * cell_w)
+                cy = int(by + (r + 0.5) * cell_h)
                 
-                for r in range(N):
-                    for c in range(N):
-                        label_id = labels[r][c]
-                        rgb = cluster_colors[label_id]
-                        cell_rgb_strings.append(f"{rgb[0]}_{rgb[1]}_{rgb[2]}")
+                # サンプル領域 (セルの中心付近 9x9 ピクセル)
+                patch = img_np[max(0, cy-4):min(h, cy+5), max(0, cx-4):min(w, cx+5)]
+                mean_rgb = patch.mean(axis=(0, 1))
+                row_samples.append(mean_rgb)
+            colors_samples.append(row_samples)
 
-                        if solution[r][c] == 1:
-                            cat_coords.append((r + 1, c + 1))
-                            coords_param_list.append(f"{r+1}_{c+1}")
-                            cx = bx + (c + 0.5) * cell_w
-                            cy = by + (r + 0.5) * cell_h
-                            rad = min(cell_w, cell_h) * 0.38
-                            
-                            draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=7)
-                            draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="red")
+        flat_samples = np.array(colors_samples).reshape(-1, 3)
+        kmeans = KMeans(n_clusters=N, random_state=42, n_init=15).fit(flat_samples)
+        labels = kmeans.labels_.reshape(N, N)
 
-                out_buffer = io.BytesIO()
-                img.save(out_buffer, format="JPEG", quality=85)
-                out_bytes = out_buffer.getvalue()
+        solution = solve_meowdoku(labels)
+        if solution is not None:
+            # ★送られてきた「元のスクリーンショット画像」の上に直接赤丸を描画★
+            draw = ImageDraw.Draw(img)
+            cat_coords = []
+            
+            for r in range(N):
+                for c in range(N):
+                    if solution[r][c] == 1:
+                        cat_coords.append((r + 1, c + 1))
+                        cx = bx + (c + 0.5) * cell_w
+                        cy = by + (r + 0.5) * cell_h
+                        rad = min(cell_w, cell_h) * 0.38
+                        
+                        # 元画像上の正解位置に二重の赤丸を描画
+                        draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=7)
+                        draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="#E60012")
 
-                # クラウドアップロード (ファイル名ランダム化)
-                public_image_url = upload_image_to_cloud(out_bytes)
+            # 加工後の「元画像＋赤丸」をJPEG化
+            out_buffer = io.BytesIO()
+            img.save(out_buffer, format="JPEG", quality=90)
+            out_bytes = out_buffer.getvalue()
 
-                # キャッシュ破棄用のパラメータを追加
-                cache_key = f"v={int(time.time())}_{uuid.uuid4().hex[:6]}"
+            # クラウドへ保存
+            public_image_url = upload_image_to_cloud(out_bytes)
+            cache_key = f"v={int(time.time())}_{uuid.uuid4().hex[:6]}"
 
-                if public_image_url:
-                    if "?" in public_image_url:
-                        public_image_url += f"&{cache_key}"
-                    else:
-                        public_image_url += f"?{cache_key}"
+            if public_image_url:
+                if "?" in public_image_url:
+                    public_image_url += f"&{cache_key}"
                 else:
-                    cats_str = ",".join(coords_param_list)
-                    colors_str = "-".join(cell_rgb_strings)
-                    public_image_url = f"{host_url}/render_solution?cats={cats_str}&colors={colors_str}&N={N}&{cache_key}"
+                    public_image_url += f"?{cache_key}"
 
-                return solution, cat_coords, public_image_url
+            return solution, cat_coords, public_image_url
 
     raise ValueError("解答パターンが見つかりませんでした。")
 
@@ -280,7 +260,6 @@ def callback():
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
     message_id = event.message.id
-    host_url = request.host_url.rstrip('/')
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -288,7 +267,7 @@ def handle_image_message(event):
 
         try:
             image_bytes = line_bot_blob_api.get_message_content(message_id=message_id)
-            solution, cat_coords, image_url = process_puzzle_image(image_bytes, host_url)
+            solution, cat_coords, image_url = process_puzzle_image(image_bytes)
 
             messages = []
 

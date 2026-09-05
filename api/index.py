@@ -96,113 +96,77 @@ def upload_to_imgur(image_bytes):
 
 
 # ==========================================
-# 2. 精密な盤面枠自動検出 (カラフルピクセル分析)
-# ==========================================
-def find_board_bounds(img_np):
-    """
-    パズル盤面のカラフルな領域の正確なバウンディングボックス (bx, by, bw, bh) を検出
-    """
-    h, w, _ = img_np.shape
-    
-    # 彩度判定 (RGBの最大値と最小値の差が大きいピクセル＝パズルの色マス)
-    r = img_np[..., 0].astype(int)
-    g = img_np[..., 1].astype(int)
-    b = img_np[..., 2].astype(int)
-    
-    color_diff = np.maximum(np.maximum(np.abs(r - g), np.abs(g - b)), np.abs(b - r))
-    
-    # 明らかな色がついているピクセル (彩度 > 25)
-    colored_mask = color_diff > 25
-
-    # 画像の上部・下部のUI領域（アイコン等）を除外するため、Y範囲を20%〜80%に限定
-    y_min_limit = int(h * 0.20)
-    y_max_limit = int(h * 0.82)
-    colored_mask[:y_min_limit, :] = False
-    colored_mask[y_max_limit:, :] = False
-
-    y_indices, x_indices = np.where(colored_mask)
-
-    if len(y_indices) > 0 and len(x_indices) > 0:
-        bx = int(np.min(x_indices))
-        by = int(np.min(y_indices))
-        bw = int(np.max(x_indices) - bx)
-        bh = int(np.max(y_indices) - by)
-        
-        # 正方形に近づける微調整
-        side = max(bw, bh)
-        return bx, by, side, side
-
-    # 万が一検出失敗した場合のバックアップ推定
-    bw = int(w * 0.9)
-    bh = bw
-    bx = int((w - bw) / 2)
-    by = int(h * 0.31) # 盤面の平均的な開始位置
-    return bx, by, bw, bh
-
-
-# ==========================================
-# 3. 画像解析 (PIL + NumPy)
+# 2. 画像解析 (PIL + NumPy)
 # ==========================================
 def process_puzzle_image(image_bytes):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
     img_np = np.array(img)
 
-    # 1. 精密な盤面枠の検出
-    bx, by, bw, bh = find_board_bounds(img_np)
+    # ゲーム画面UIに基づく盤面領域の精密固定相対位置
+    # 横幅の88.5%を正方形の盤面とする
+    bw = int(w * 0.885)
+    bh = bw
+    bx = int((w - bw) / 2)
+    
+    # Y座標：上部UIの下、画面全体の31.2%〜31.5%の位置が盤面領域の上端
+    # いくつかのわずかなオフセット位置を試行して認識失敗を防止
+    y_offsets = [int(h * 0.313), int(h * 0.310), int(h * 0.316), int(h * 0.305), int(h * 0.320)]
 
-    # 2. 9x9 または 10x10 の判定と解法
-    for N in [9, 10]:
-        cell_w = bw / N
-        cell_h = bh / N
-        colors_samples = []
+    for by in y_offsets:
+        # 9x9 または 10x10 の両方でパズル解決を試みる
+        for N in [9, 10]:
+            cell_w = bw / N
+            cell_h = bh / N
+            colors_samples = []
 
-        for r in range(N):
-            row_samples = []
-            for c in range(N):
-                cx = int(bx + (c + 0.5) * cell_w)
-                cy = int(by + (r + 0.5) * cell_h)
-                patch = img_np[max(0, cy-3):cy+4, max(0, cx-3):cx+4]
-                mean_rgb = patch.mean(axis=(0, 1))
-                row_samples.append(mean_rgb)
-            colors_samples.append(row_samples)
-
-        flat_samples = np.array(colors_samples).reshape(-1, 3)
-        kmeans = KMeans(n_clusters=N, random_state=42, n_init=10).fit(flat_samples)
-        labels = kmeans.labels_.reshape(N, N)
-
-        solution = solve_meowdoku(labels)
-        if solution is not None:
-            # 解が見つかったら描画
-            draw = ImageDraw.Draw(img)
-            cat_coords = []
             for r in range(N):
+                row_samples = []
                 for c in range(N):
-                    if solution[r][c] == 1:
-                        cat_coords.append((r + 1, c + 1))
-                        cx = bx + (c + 0.5) * cell_w
-                        cy = by + (r + 0.5) * cell_h
-                        rad = min(cell_w, cell_h) * 0.38
-                        
-                        # 太い赤色の二重丸を中心ピッタリに描画
-                        draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=7)
-                        draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="red")
+                    cx = int(bx + (c + 0.5) * cell_w)
+                    cy = int(by + (r + 0.5) * cell_h)
+                    # セル中心部 7x7 ピクセルの平均RGBを取得
+                    patch = img_np[max(0, cy-3):min(h, cy+4), max(0, cx-3):min(w, cx+4)]
+                    mean_rgb = patch.mean(axis=(0, 1))
+                    row_samples.append(mean_rgb)
+                colors_samples.append(row_samples)
 
-            # 画像をバイト列に変換
-            out_buffer = io.BytesIO()
-            img.save(out_buffer, format="JPEG", quality=85)
-            out_bytes = out_buffer.getvalue()
+            flat_samples = np.array(colors_samples).reshape(-1, 3)
+            kmeans = KMeans(n_clusters=N, random_state=42, n_init=10).fit(flat_samples)
+            labels = kmeans.labels_.reshape(N, N)
 
-            # Imgur にアップロードして公開URLを取得
-            public_image_url = upload_to_imgur(out_bytes)
+            solution = solve_meowdoku(labels)
+            if solution is not None:
+                # 解が見つかったら描画
+                draw = ImageDraw.Draw(img)
+                cat_coords = []
+                for r in range(N):
+                    for c in range(N):
+                        if solution[r][c] == 1:
+                            cat_coords.append((r + 1, c + 1))
+                            cx = bx + (c + 0.5) * cell_w
+                            cy = by + (r + 0.5) * cell_h
+                            rad = min(cell_w, cell_h) * 0.38
+                            
+                            # 赤色の二重丸を描画
+                            draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=7)
+                            draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="red")
 
-            return solution, cat_coords, public_image_url
+                # 画像をバイト列に変換
+                out_buffer = io.BytesIO()
+                img.save(out_buffer, format="JPEG", quality=85)
+                out_bytes = out_buffer.getvalue()
+
+                # Imgur にアップロードして公開URLを取得
+                public_image_url = upload_to_imgur(out_bytes)
+
+                return solution, cat_coords, public_image_url
 
     raise ValueError("解答パターンが見つかりませんでした。")
 
 
 # ==========================================
-# 4. Webhook エンドポイント
+# 3. Webhook エンドポイント
 # ==========================================
 @app.route("/", methods=['GET'])
 def index():
@@ -220,7 +184,7 @@ def callback():
 
 
 # ==========================================
-# 5. LINE メッセージ処理
+# 4. LINE メッセージ処理
 # ==========================================
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):

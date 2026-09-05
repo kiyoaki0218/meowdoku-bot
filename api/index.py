@@ -8,8 +8,6 @@ import requests
 import numpy as np
 from PIL import Image, ImageDraw
 from flask import Flask, request, abort, send_file
-from sklearn.cluster import KMeans
-
 # LINE SDK v3 Imports
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -185,6 +183,36 @@ def find_perfect_board_offset(img_np):
     return bx, best_by, bw, bh
 
 
+def kmeans_plus_plus_init(X, n_clusters):
+    centroids = []
+    centroids.append(X[np.random.randint(X.shape[0])])
+    for _ in range(1, n_clusters):
+        dists = np.min(np.linalg.norm(X[:, np.newaxis] - np.array(centroids), axis=2), axis=1)
+        # Avoid division by zero if all distances are zero
+        sum_dists = np.sum(dists ** 2)
+        if sum_dists == 0:
+            probs = np.ones(X.shape[0]) / X.shape[0]
+        else:
+            probs = dists ** 2 / sum_dists
+        next_centroid = X[np.random.choice(X.shape[0], p=probs)]
+        centroids.append(next_centroid)
+    return np.array(centroids)
+
+def simple_kmeans(X, n_clusters, max_iters=20):
+    np.random.seed(42)
+    centroids = kmeans_plus_plus_init(X, n_clusters).astype(np.float32)
+    labels = np.zeros(X.shape[0], dtype=int)
+    for _ in range(max_iters):
+        dists = np.linalg.norm(X[:, np.newaxis] - centroids, axis=2)
+        new_labels = np.argmin(dists, axis=1)
+        if np.all(labels == new_labels):
+            break
+        labels = new_labels
+        for k in range(n_clusters):
+            if np.any(labels == k):
+                centroids[k] = X[labels == k].mean(axis=0)
+    return labels
+
 # ==========================================
 # 4. 元画像高精度解析 & オーバーレイ
 # ==========================================
@@ -213,8 +241,9 @@ def process_puzzle_image(image_bytes, host_url):
             colors_samples.append(row_samples)
 
         flat_samples = np.array(colors_samples).reshape(-1, 3)
-        kmeans = KMeans(n_clusters=N, random_state=42, n_init=15).fit(flat_samples)
-        labels = kmeans.labels_.reshape(N, N)
+        # sklearn.cluster.KMeans の代わりに自作関数を使う
+        labels = simple_kmeans(flat_samples, n_clusters=N)
+        labels = labels.reshape(N, N)
 
         solution = solve_meowdoku(labels)
         if solution is not None:

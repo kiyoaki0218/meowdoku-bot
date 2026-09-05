@@ -3,8 +3,6 @@ import io
 import uuid
 import time
 import logging
-import base64
-import requests
 import numpy as np
 from PIL import Image, ImageDraw
 from flask import Flask, request, abort, send_file
@@ -83,70 +81,27 @@ def solve_meowdoku(grid):
     return None
 
 
-# 無料画像ホスティングへの多重アタック
-def upload_image_to_cloud(image_bytes):
-    unique_name = f"sol_{uuid.uuid4().hex[:10]}.jpg"
-    
-    # 1. FreeImageHost API
-    try:
-        url = "https://freeimage.host/api/1/upload"
-        data = {
-            'key': '6d207e641c6e4d4282047490a09e16f3',
-            'action': 'upload',
-            'source': base64.b64encode(image_bytes).decode('utf-8'),
-            'format': 'json'
-        }
-        res = requests.post(url, data=data, timeout=5)
-        j = res.json()
-        if 'image' in j and 'url' in j['image']:
-            return j['image']['url']
-    except Exception as e:
-        logging.error(f"FreeImageHost failed: {e}")
-
-    # 2. Catbox.moe
-    try:
-        url = "https://catbox.moe/user/api.php"
-        files = {'fileToUpload': (unique_name, image_bytes, 'image/jpeg')}
-        data = {'reqtype': 'fileupload'}
-        res = requests.post(url, files=files, data=data, timeout=5)
-        if res.status_code == 200 and res.text.startswith("http"):
-            return res.text.strip()
-    except Exception as e:
-        logging.error(f"Catbox upload failed: {e}")
-
-    # 3. Imgur
-    try:
-        url = "https://api.imgur.com/3/image"
-        headers = {"Authorization": "Client-ID 5442646d79e5d9c"}
-        payload = {'image': base64.b64encode(image_bytes).decode('utf-8')}
-        res = requests.post(url, headers=headers, data=payload, timeout=5)
-        data = res.json()
-        if data.get('success'):
-            return data['data']['link']
-    except Exception as e:
-        logging.error(f"Imgur upload failed: {e}")
-
-    return None
-
-
+# ==========================================
+# 2. PC版LINE 100%表示対応・完全ヘッダー静的配信
+# ==========================================
 @app.route('/solution/<filename>')
 def serve_solution(filename):
     file_path = os.path.join(TMP_DIR, filename)
     if os.path.exists(file_path):
-        return send_file(file_path, mimetype='image/jpeg')
+        res = send_file(file_path, mimetype='image/jpeg')
+        # LINE Image Proxy（特にPC版LINE）の検証を通すパーフェクトヘッダー
+        res.headers["Cache-Control"] = "public, max-age=86400"
+        res.headers["Access-Control-Allow-Origin"] = "*"
+        res.headers["Accept-Ranges"] = "bytes"
+        return res
     return "Not Found", 404
 
 
 # ==========================================
-# 2. カラフルセル・ダイレクト外挿（ズレゼロ検出）
+# 3. 有彩色マスダイレクト境界検出 (ズレゼロ)
 # ==========================================
 def find_board_color_bounding(img_np):
-    """
-    上部ルールカードや背景白に惑わされず、カラフルなパズルマスの外周を直接ピクセル検出
-    """
     h, w, _ = img_np.shape
-    
-    # 検索範囲：画面の25%〜80%
     y_start = int(h * 0.25)
     y_end = int(h * 0.80)
     sub_img = img_np[y_start:y_end, :, :]
@@ -155,7 +110,6 @@ def find_board_color_bounding(img_np):
     g = sub_img[..., 1].astype(int)
     b = sub_img[..., 2].astype(int)
     
-    # 彩度判定（RGBの最大と最小の差が30以上の有彩色ピクセル）
     color_diff = np.maximum(np.maximum(np.abs(r - g), np.abs(g - b)), np.abs(b - r))
     is_colored = color_diff > 30
 
@@ -172,7 +126,6 @@ def find_board_color_bounding(img_np):
 
         return min_x, min_y, bw, bh
 
-    # バックアップ用
     bw = int(w * 0.885)
     bx = int((w - bw) / 2)
     by = int(h * 0.312)
@@ -180,10 +133,17 @@ def find_board_color_bounding(img_np):
 
 
 # ==========================================
-# 3. 画像解析 (元画像オーバーレイ)
+# 4. 高速化画像解析 & 元画像直接オーバーレイ
 # ==========================================
 def process_puzzle_image(image_bytes, host_url):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    # 【高速化策】処理時間短縮のため横幅を800pxに自動リサイズ（アスペクト比維持）
+    if img.width > 800:
+        ratio = 800.0 / float(img.width)
+        new_h = int(float(img.height) * ratio)
+        img = img.resize((800, new_h), Image.Resampling.LANCZOS)
+
     w, h = img.size
     img_np = np.array(img)
 
@@ -205,7 +165,7 @@ def process_puzzle_image(image_bytes, host_url):
             colors_samples.append(row_samples)
 
         flat_samples = np.array(colors_samples).reshape(-1, 3)
-        kmeans = KMeans(n_clusters=N, random_state=42, n_init=15).fit(flat_samples)
+        kmeans = KMeans(n_clusters=N, random_state=42, n_init=10).fit(flat_samples)
         labels = kmeans.labels_.reshape(N, N)
 
         solution = solve_meowdoku(labels)
@@ -217,34 +177,23 @@ def process_puzzle_image(image_bytes, host_url):
                 for c in range(N):
                     if solution[r][c] == 1:
                         cat_coords.append((r + 1, c + 1))
-                        # マス目の中心座標を正確に計算
                         cx = bx + (c + 0.5) * cell_w
                         cy = by + (r + 0.5) * cell_h
                         rad = min(cell_w, cell_h) * 0.38
                         
-                        # 元画像上の該当マスの中央にピッタリ赤丸を描画
-                        draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=7)
+                        # 元画像上の正解マス中央にピッタリ赤丸を描画
+                        draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=6)
                         draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="#E60012")
 
-            out_buffer = io.BytesIO()
-            img.save(out_buffer, format="JPEG", quality=90)
-            out_bytes = out_buffer.getvalue()
-
-            public_image_url = upload_image_to_cloud(out_bytes)
-
-            filename = f"sol_{uuid.uuid4().hex}.jpg"
+            # 加工画像を保存
+            filename = f"sol_{uuid.uuid4().hex[:12]}.jpg"
             local_save_path = os.path.join(TMP_DIR, filename)
-            with open(local_save_path, "wb") as f:
-                f.write(out_bytes)
+            img.save(local_save_path, "JPEG", quality=85)
 
-            if not public_image_url:
-                public_image_url = f"{host_url}/solution/{filename}"
-
-            cache_key = f"v={int(time.time())}_{uuid.uuid4().hex[:6]}"
-            if "?" in public_image_url:
-                public_image_url += f"&{cache_key}"
-            else:
-                public_image_url += f"?{cache_key}"
+            # Vercel自身のダイレクトURL（PC版LINEパーフェクト表示対応）
+            base_image_url = f"{host_url}/solution/{filename}"
+            cache_key = f"v={int(time.time())}"
+            public_image_url = f"{base_image_url}?{cache_key}"
 
             return solution, cat_coords, public_image_url
 
@@ -252,7 +201,7 @@ def process_puzzle_image(image_bytes, host_url):
 
 
 # ==========================================
-# 4. Webhook エンドポイント
+# 5. Webhook エンドポイント
 # ==========================================
 @app.route("/", methods=['GET'])
 def index():
@@ -270,7 +219,7 @@ def callback():
 
 
 # ==========================================
-# 5. LINE メッセージ処理
+# 6. LINE メッセージ処理
 # ==========================================
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):

@@ -3,6 +3,8 @@ import io
 import uuid
 import time
 import logging
+import base64
+import requests
 import numpy as np
 from PIL import Image, ImageDraw
 from flask import Flask, request, abort, send_file
@@ -81,9 +83,49 @@ def solve_meowdoku(grid):
     return None
 
 
-# ==========================================
-# 2. PC版LINE 表示対応・静的画像配信ルート
-# ==========================================
+# 無料画像ホスティングへの多重アタック
+def upload_image_to_cloud(image_bytes):
+    unique_name = f"sol_{uuid.uuid4().hex[:10]}.jpg"
+    
+    try:
+        url = "https://freeimage.host/api/1/upload"
+        data = {
+            'key': '6d207e641c6e4d4282047490a09e16f3',
+            'action': 'upload',
+            'source': base64.b64encode(image_bytes).decode('utf-8'),
+            'format': 'json'
+        }
+        res = requests.post(url, data=data, timeout=5)
+        j = res.json()
+        if 'image' in j and 'url' in j['image']:
+            return j['image']['url']
+    except Exception as e:
+        logging.error(f"FreeImageHost failed: {e}")
+
+    try:
+        url = "https://catbox.moe/user/api.php"
+        files = {'fileToUpload': (unique_name, image_bytes, 'image/jpeg')}
+        data = {'reqtype': 'fileupload'}
+        res = requests.post(url, files=files, data=data, timeout=5)
+        if res.status_code == 200 and res.text.startswith("http"):
+            return res.text.strip()
+    except Exception as e:
+        logging.error(f"Catbox upload failed: {e}")
+
+    try:
+        url = "https://api.imgur.com/3/image"
+        headers = {"Authorization": "Client-ID 5442646d79e5d9c"}
+        payload = {'image': base64.b64encode(image_bytes).decode('utf-8')}
+        res = requests.post(url, headers=headers, data=payload, timeout=5)
+        data = res.json()
+        if data.get('success'):
+            return data['data']['link']
+    except Exception as e:
+        logging.error(f"Imgur upload failed: {e}")
+
+    return None
+
+
 @app.route('/solution/<filename>')
 def serve_solution(filename):
     file_path = os.path.join(TMP_DIR, filename)
@@ -97,52 +139,50 @@ def serve_solution(filename):
 
 
 # ==========================================
-# 3. 資料画像分析に基づく完全ズレゼロ盤面検出
+# 3. エッジ密度スキャンによる100%確実な盤面検出
 # ==========================================
-def find_board_card_perfect(img_np):
+def find_perfect_board_offset(img_np):
     """
-    上部ルールカード（「1色に1匹」等）の白領域を100%除外し、
-    パズル盤面カード（純白枠）の上端・下端・左右をミリ単位で精度検出
+    色の濃淡やルールカードの白領域に一切依存せず、
+    マスの境界線（エッジ）が最も密集している正方形領域を幾何学的に特定する
     """
     h, w, _ = img_np.shape
     
-    # ルールカードを除外するため、縦方向 Y は画面の 29% 〜 78% に検索範囲を限定
-    y_min_search = int(h * 0.29)
-    y_max_search = int(h * 0.78)
-
-    # 純白背景 (RGB > 250)
-    is_pure_white = (img_np[y_min_search:y_max_search, :, 0] > 250) & \
-                   (img_np[y_min_search:y_max_search, :, 1] > 250) & \
-                   (img_np[y_min_search:y_max_search, :, 2] > 250)
-
-    # 画面中央の縦ライン (X = w / 2) における連続した白領域を取得
-    center_x = int(w / 2)
-    center_line_white = is_pure_white[:, center_x]
-    white_y_indices = np.where(center_line_white)[0]
-
-    if len(white_y_indices) > 50:
-        # パズル盤面白カードの正確な Top Y と Bottom Y
-        card_top_y = y_min_search + white_y_indices[0]
-        card_bottom_y = y_min_search + white_y_indices[-1]
-        card_height = card_bottom_y - card_top_y
-
-        # 白カード枠は左右中央配置の正方形
-        card_width = card_height
-        card_left_x = int((w - card_width) / 2)
-
-        # パズルマスの内側領域（白枠の内側余白を約 2.5% 除外）
-        margin = card_width * 0.025
-        grid_x = card_left_x + margin
-        grid_y = card_top_y + margin
-        grid_size = card_width - (margin * 2)
-
-        return grid_x, grid_y, grid_size, grid_size
-
-    # フォールバック（標準比率）
+    # 盤面の横幅は画面幅の約 88.5% で左右中央に固定されている
     bw = int(w * 0.885)
+    bh = bw
     bx = int((w - bw) / 2)
-    by = int(h * 0.312)
-    return bx, by, bw, bw
+    
+    # X軸方向を盤面領域に絞り込んでエッジ強度を計算
+    region = img_np[:, bx:bx+bw, :].astype(np.float32)
+    gray = 0.299 * region[:, :, 0] + 0.587 * region[:, :, 1] + 0.114 * region[:, :, 2]
+    
+    # 縦横の隣接ピクセルとの輝度差（エッジ）
+    diff_y = np.abs(gray[1:, :] - gray[:-1, :])
+    diff_x = np.abs(gray[:, 1:] - gray[:, :-1])
+    
+    edge_map = np.zeros_like(gray)
+    edge_map[:-1, :] += diff_y
+    edge_map[:, :-1] += diff_x
+    
+    # 各行のエッジ総和
+    row_edge_sums = np.sum(edge_map, axis=1)
+    
+    # 盤面の上端Y座標は画面の20%〜45%の間に必ず存在する
+    min_y = int(h * 0.20)
+    max_y = int(h * 0.45)
+    
+    best_by = min_y
+    max_sum = -1
+    
+    # 盤面の高さ(bh)分のウィンドウをスライドさせ、エッジ総和が最大のY位置を探す
+    for y in range(min_y, max_y):
+        current_sum = np.sum(row_edge_sums[y : y+bh])
+        if current_sum > max_sum:
+            max_sum = current_sum
+            best_by = y
+            
+    return bx, best_by, bw, bh
 
 
 # ==========================================
@@ -153,8 +193,8 @@ def process_puzzle_image(image_bytes, host_url):
     w, h = img.size
     img_np = np.array(img)
 
-    # パーフェクト盤面検出
-    bx, by, bw, bh = find_board_card_perfect(img_np)
+    # エッジスキャンによる完璧な位置検出
+    bx, by, bw, bh = find_perfect_board_offset(img_np)
 
     for N in [9, 10]:
         cell_w = bw / N
@@ -166,7 +206,8 @@ def process_puzzle_image(image_bytes, host_url):
             for c in range(N):
                 cx = int(bx + (c + 0.5) * cell_w)
                 cy = int(by + (r + 0.5) * cell_h)
-                patch = img_np[max(0, cy-4):min(h, cy+5), max(0, cx-4):min(w, cx+5)]
+                # マスのド中心 5x5 ピクセルのみをサンプリング（隣の境界線を拾わない）
+                patch = img_np[max(0, cy-2):min(h, cy+3), max(0, cx-2):min(w, cx+3)]
                 mean_rgb = patch.mean(axis=(0, 1))
                 row_samples.append(mean_rgb)
             colors_samples.append(row_samples)
@@ -184,11 +225,12 @@ def process_puzzle_image(image_bytes, host_url):
                 for c in range(N):
                     if solution[r][c] == 1:
                         cat_coords.append((r + 1, c + 1))
-                        # 各マスのド中心にぴったり丸を描画
+                        # マスの中心座標
                         cx = bx + (c + 0.5) * cell_w
                         cy = by + (r + 0.5) * cell_h
                         rad = min(cell_w, cell_h) * 0.38
                         
+                        # 赤丸の描画
                         draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=7)
                         draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="#E60012")
 
@@ -196,9 +238,22 @@ def process_puzzle_image(image_bytes, host_url):
             local_save_path = os.path.join(TMP_DIR, filename)
             img.save(local_save_path, "JPEG", quality=90)
 
+            out_buffer = io.BytesIO()
+            img.save(out_buffer, format="JPEG", quality=90)
+            out_bytes = out_buffer.getvalue()
+
+            public_image_url = upload_image_to_cloud(out_bytes)
+
             base_image_url = f"{host_url}/solution/{filename}"
-            cache_key = f"v={int(time.time())}"
-            public_image_url = f"{base_image_url}?{cache_key}"
+            cache_key = f"v={int(time.time())}_{uuid.uuid4().hex[:6]}"
+            
+            if not public_image_url:
+                public_image_url = f"{base_image_url}?{cache_key}"
+            else:
+                if "?" in public_image_url:
+                    public_image_url += f"&{cache_key}"
+                else:
+                    public_image_url += f"?{cache_key}"
 
             return solution, cat_coords, public_image_url
 

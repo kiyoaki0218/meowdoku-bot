@@ -2,6 +2,8 @@ import os
 import io
 import uuid
 import logging
+import base64
+import requests
 import numpy as np
 from PIL import Image, ImageDraw
 from flask import Flask, request, abort, send_file
@@ -30,9 +32,6 @@ CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
-
-# Vercel上のインメモリ画像キャッシュ (/tmp を活用)
-TMP_DIR = "/tmp"
 
 # ==========================================
 # 1. パズル解法ロジック (バックトラッキング)
@@ -81,6 +80,21 @@ def solve_meowdoku(grid):
     return None
 
 
+# Imgur への無料画像アップロード関数
+def upload_to_imgur(image_bytes):
+    try:
+        url = "https://api.imgur.com/3/image"
+        headers = {"Authorization": "Client-ID 5442646d79e5d9c"}
+        payload = {'image': base64.b64encode(image_bytes).decode('utf-8')}
+        res = requests.post(url, headers=headers, data=payload, timeout=10)
+        data = res.json()
+        if data.get('success'):
+            return data['data']['link']
+    except Exception as e:
+        logging.error(f"Imgur upload failed: {e}")
+    return None
+
+
 # ==========================================
 # 2. 画像解析 (PIL + NumPy)
 # ==========================================
@@ -106,7 +120,6 @@ def process_puzzle_image(image_bytes):
             for c in range(N):
                 cx = int(bx + (c + 0.5) * cell_w)
                 cy = int(by + (r + 0.5) * cell_h)
-                # マスの中央領域の色を取得
                 patch = img_np[max(0, cy-3):cy+4, max(0, cx-3):cx+4]
                 mean_rgb = patch.mean(axis=(0, 1))
                 row_samples.append(mean_rgb)
@@ -120,9 +133,11 @@ def process_puzzle_image(image_bytes):
         if solution is not None:
             # 解が見つかったら描画
             draw = ImageDraw.Draw(img)
+            cat_coords = []
             for r in range(N):
                 for c in range(N):
                     if solution[r][c] == 1:
+                        cat_coords.append((r + 1, c + 1))
                         cx = bx + (c + 0.5) * cell_w
                         cy = by + (r + 0.5) * cell_h
                         rad = min(cell_w, cell_h) * 0.35
@@ -130,17 +145,21 @@ def process_puzzle_image(image_bytes):
                         draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=6)
                         draw.ellipse([cx - rad*0.4, cy - rad*0.4, cx + rad*0.4, cy + rad*0.4], fill="red")
             
-            # /tmp に一時保存
-            filename = f"{uuid.uuid4().hex}.jpg"
-            save_path = os.path.join(TMP_DIR, filename)
-            img.save(save_path, "JPEG", quality=85)
-            return filename
+            # 画像をバイト列に変換
+            out_buffer = io.BytesIO()
+            img.save(out_buffer, format="JPEG", quality=85)
+            out_bytes = out_buffer.getvalue()
+
+            # Imgur にアップロードして公開URLを取得
+            public_image_url = upload_to_imgur(out_bytes)
+
+            return solution, cat_coords, public_image_url
 
     raise ValueError("解答パターンが見つかりませんでした。")
 
 
 # ==========================================
-# 3. Webhook & 静的画像配信エンドポイント
+# 3. Webhook エンドポイント
 # ==========================================
 @app.route("/", methods=['GET'])
 def index():
@@ -156,14 +175,6 @@ def callback():
         abort(400)
     return 'OK'
 
-# Vercel上で解答画像を配信するルート
-@app.route('/solution/<filename>')
-def serve_solution(filename):
-    file_path = os.path.join(TMP_DIR, filename)
-    if os.path.exists(file_path):
-        return send_file(file_path, mimetype='image/jpeg')
-    return "Not Found", 404
-
 
 # ==========================================
 # 4. LINE メッセージ処理
@@ -171,8 +182,6 @@ def serve_solution(filename):
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
     message_id = event.message.id
-    # リクエストのホスト名から Vercel の URL を動的に取得
-    host_url = request.host_url.rstrip('/')
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -180,18 +189,26 @@ def handle_image_message(event):
 
         try:
             image_bytes = line_bot_blob_api.get_message_content(message_id=message_id)
-            solution_filename = process_puzzle_image(image_bytes)
+            solution, cat_coords, image_url = process_puzzle_image(image_bytes)
 
-            image_url = f"{host_url}/solution/{solution_filename}"
+            messages = []
 
-            reply_message = ImageMessage(
-                original_content_url=image_url,
-                preview_image_url=image_url
-            )
+            # 1. テキスト形式のネコの位置情報
+            coord_text = "🐱 ネコの位置（上から何行目 - 左から何列目）：\n"
+            coord_text += "\n".join([f"・{r}行目 - {c}列目" for r, c in cat_coords])
+            messages.append(TextMessage(text=coord_text))
+
+            # 2. 画像メッセージ (URLが取得できている場合)
+            if image_url:
+                messages.append(ImageMessage(
+                    original_content_url=image_url,
+                    preview_image_url=image_url
+                ))
+
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[reply_message]
+                    messages=messages
                 )
             )
         except Exception as e:

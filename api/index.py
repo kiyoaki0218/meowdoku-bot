@@ -1,6 +1,7 @@
 import os
 import io
 import uuid
+import time
 import logging
 import base64
 import requests
@@ -80,12 +81,14 @@ def solve_meowdoku(grid):
     return None
 
 
-# 無料画像ホスティングへのアップロード（Multiple Services Fallback）
+# 無料画像ホスティングへのアップロード（完全にユニークなファイル名でキャッシュ回避）
 def upload_image_to_cloud(image_bytes):
-    # 1. Catbox.moe / ImgBB 無料無制限アップロード
+    unique_name = f"solution_{uuid.uuid4().hex}.jpg"
+    
+    # 1. Catbox.moe 無料無制限アップロード
     try:
         url = "https://catbox.moe/user/api.php"
-        files = {'fileToUpload': ('solution.jpg', image_bytes, 'image/jpeg')}
+        files = {'fileToUpload': (unique_name, image_bytes, 'image/jpeg')}
         data = {'reqtype': 'fileupload'}
         res = requests.post(url, files=files, data=data, timeout=6)
         if res.status_code == 200 and res.text.startswith("http"):
@@ -97,7 +100,7 @@ def upload_image_to_cloud(image_bytes):
     try:
         url = "https://api.imgur.com/3/image"
         headers = {"Authorization": "Client-ID 5442646d79e5d9c"}
-        payload = {'image': base64.b64encode(image_bytes).decode('utf-8')}
+        payload = {'image': base64.b64encode(image_bytes).decode('utf-8'), 'name': unique_name}
         res = requests.post(url, headers=headers, data=payload, timeout=6)
         data = res.json()
         if data.get('success'):
@@ -132,7 +135,7 @@ def render_solution():
         img = Image.new("RGB", (img_size, img_size), "#F7F4EF")
         draw = ImageDraw.Draw(img)
         
-        # 1. 各マスのカラフルな色ブロックを角丸で描画
+        # 各マスのカラフルな色ブロックを角丸で描画
         for r in range(N):
             for c in range(N):
                 idx = r * N + c
@@ -146,10 +149,9 @@ def render_solution():
                 x2 = padding + (c + 1) * cell_size - 2
                 y2 = padding + (r + 1) * cell_size - 2
                 
-                # カラフルな角丸ブロック描画
                 draw.rounded_rectangle([x1, y1, x2, y2], radius=6, fill=rgb)
                 
-        # 2. 赤丸（ネコの位置）の描画
+        # 赤丸（ネコの位置）の描画
         for r, c in coords:
             r_idx = r - 1
             c_idx = c - 1
@@ -204,7 +206,6 @@ def process_puzzle_image(image_bytes, host_url):
 
             solution = solve_meowdoku(labels)
             if solution is not None:
-                # 代表色マッピングの取得
                 cluster_colors = {}
                 for k in range(N):
                     cluster_colors[k] = kmeans.cluster_centers_[k].astype(int)
@@ -230,19 +231,25 @@ def process_puzzle_image(image_bytes, host_url):
                             draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=7)
                             draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="red")
 
-                # 元画像ベースの描画保存
                 out_buffer = io.BytesIO()
                 img.save(out_buffer, format="JPEG", quality=85)
                 out_bytes = out_buffer.getvalue()
 
-                # 高速クラウドアップロード（Catbox/Imgur）
+                # クラウドアップロード (ファイル名ランダム化)
                 public_image_url = upload_image_to_cloud(out_bytes)
 
-                # アップロード失敗時の自前フルカラーパズル描画フォールバック
-                if not public_image_url:
+                # キャッシュ破棄用のパラメータを追加
+                cache_key = f"v={int(time.time())}_{uuid.uuid4().hex[:6]}"
+
+                if public_image_url:
+                    if "?" in public_image_url:
+                        public_image_url += f"&{cache_key}"
+                    else:
+                        public_image_url += f"?{cache_key}"
+                else:
                     cats_str = ",".join(coords_param_list)
                     colors_str = "-".join(cell_rgb_strings)
-                    public_image_url = f"{host_url}/render_solution?cats={cats_str}&colors={colors_str}&N={N}"
+                    public_image_url = f"{host_url}/render_solution?cats={cats_str}&colors={colors_str}&N={N}&{cache_key}"
 
                 return solution, cat_coords, public_image_url
 

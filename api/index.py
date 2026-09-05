@@ -82,14 +82,13 @@ def solve_meowdoku(grid):
 
 
 # ==========================================
-# 2. PC版LINE 100%表示対応・完全ヘッダー静的配信
+# 2. PC版LINE 100%表示対応・静的画像配信ルート
 # ==========================================
 @app.route('/solution/<filename>')
 def serve_solution(filename):
     file_path = os.path.join(TMP_DIR, filename)
     if os.path.exists(file_path):
         res = send_file(file_path, mimetype='image/jpeg')
-        # LINE Image Proxy（特にPC版LINE）の検証を通すパーフェクトヘッダー
         res.headers["Cache-Control"] = "public, max-age=86400"
         res.headers["Access-Control-Allow-Origin"] = "*"
         res.headers["Accept-Ranges"] = "bytes"
@@ -98,7 +97,7 @@ def serve_solution(filename):
 
 
 # ==========================================
-# 3. 有彩色マスダイレクト境界検出 (ズレゼロ)
+# 3. カラフルセル・ダイレクト外挿（ズレゼロ検出・元画像用）
 # ==========================================
 def find_board_color_bounding(img_np):
     h, w, _ = img_np.shape
@@ -133,17 +132,11 @@ def find_board_color_bounding(img_np):
 
 
 # ==========================================
-# 4. 高速化画像解析 & 元画像直接オーバーレイ
+# 4. 元画像高精度解析 (リサイズ無しの完全元の精度)
 # ==========================================
 def process_puzzle_image(image_bytes, host_url):
+    # 元画像の解像度を 100% 保持（リサイズなしでズレを防止）
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    # 【高速化策】処理時間短縮のため横幅を800pxに自動リサイズ（アスペクト比維持）
-    if img.width > 800:
-        ratio = 800.0 / float(img.width)
-        new_h = int(float(img.height) * ratio)
-        img = img.resize((800, new_h), Image.Resampling.LANCZOS)
-
     w, h = img.size
     img_np = np.array(img)
 
@@ -165,7 +158,7 @@ def process_puzzle_image(image_bytes, host_url):
             colors_samples.append(row_samples)
 
         flat_samples = np.array(colors_samples).reshape(-1, 3)
-        kmeans = KMeans(n_clusters=N, random_state=42, n_init=10).fit(flat_samples)
+        kmeans = KMeans(n_clusters=N, random_state=42, n_init=15).fit(flat_samples)
         labels = kmeans.labels_.reshape(N, N)
 
         solution = solve_meowdoku(labels)
@@ -181,16 +174,14 @@ def process_puzzle_image(image_bytes, host_url):
                         cy = by + (r + 0.5) * cell_h
                         rad = min(cell_w, cell_h) * 0.38
                         
-                        # 元画像上の正解マス中央にピッタリ赤丸を描画
-                        draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=6)
+                        # 元画像のオリジナル高画質上にピタッと赤丸を描画
+                        draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=7)
                         draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="#E60012")
 
-            # 加工画像を保存
             filename = f"sol_{uuid.uuid4().hex[:12]}.jpg"
             local_save_path = os.path.join(TMP_DIR, filename)
-            img.save(local_save_path, "JPEG", quality=85)
+            img.save(local_save_path, "JPEG", quality=90)
 
-            # Vercel自身のダイレクトURL（PC版LINEパーフェクト表示対応）
             base_image_url = f"{host_url}/solution/{filename}"
             cache_key = f"v={int(time.time())}"
             public_image_url = f"{base_image_url}?{cache_key}"

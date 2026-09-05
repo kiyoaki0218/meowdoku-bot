@@ -6,7 +6,7 @@ import base64
 import requests
 import numpy as np
 from PIL import Image, ImageDraw
-from flask import Flask, request, abort, send_file
+from flask import Flask, request, abort, send_file, render_template_string
 from sklearn.cluster import KMeans
 
 # LINE SDK v3 Imports
@@ -86,7 +86,7 @@ def upload_to_imgur(image_bytes):
         url = "https://api.imgur.com/3/image"
         headers = {"Authorization": "Client-ID 5442646d79e5d9c"}
         payload = {'image': base64.b64encode(image_bytes).decode('utf-8')}
-        res = requests.post(url, headers=headers, data=payload, timeout=10)
+        res = requests.post(url, headers=headers, data=payload, timeout=5)
         data = res.json()
         if data.get('success'):
             return data['data']['link']
@@ -96,25 +96,66 @@ def upload_to_imgur(image_bytes):
 
 
 # ==========================================
-# 2. 画像解析 (PIL + NumPy)
+# 2. オンデマンド画像生成 (LINE画像配信用)
 # ==========================================
-def process_puzzle_image(image_bytes):
+@app.route("/render_solution")
+def render_solution():
+    """
+    外部画像アップロードが失敗した場合でも、確実にLINEへ画像を返すためのオンデマンド描画ルート
+    """
+    try:
+        cats_param = request.args.get("cats", "")
+        N = int(request.args.get("N", 9))
+        
+        coords = [tuple(map(int, p.split("_"))) for p in cats_param.split(",") if p]
+        
+        # 600x600 のシンプルな解答ボード画像を動的作成
+        img_size = 600
+        img = Image.new("RGB", (img_size, img_size), "#F8F4F0")
+        draw = ImageDraw.Draw(img)
+        
+        cell_size = img_size / N
+        
+        # 枠線の描画
+        for i in range(N + 1):
+            draw.line([(i * cell_size, 0), (i * cell_size, img_size)], fill="#D0C8B8", width=2)
+            draw.line([(0, i * cell_size), (img_size, i * cell_size)], fill="#D0C8B8", width=2)
+            
+        # ネコ（赤丸）の位置を描画
+        for r, c in coords:
+            # 1-indexed to 0-indexed
+            r_idx = r - 1
+            c_idx = c - 1
+            cx = (c_idx + 0.5) * cell_size
+            cy = (r_idx + 0.5) * cell_size
+            rad = cell_size * 0.35
+            
+            draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=6)
+            draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="red")
+            
+        out_buf = io.BytesIO()
+        img.save(out_buf, "JPEG", quality=90)
+        out_buf.seek(0)
+        return send_file(out_buf, mimetype="image/jpeg")
+    except Exception as e:
+        logging.error(f"Render solution failed: {e}")
+        return "Error", 500
+
+
+# ==========================================
+# 3. 画像解析 (PIL + NumPy)
+# ==========================================
+def process_puzzle_image(image_bytes, host_url):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
     img_np = np.array(img)
 
-    # ゲーム画面UIに基づく盤面領域の精密固定相対位置
-    # 横幅の88.5%を正方形の盤面とする
     bw = int(w * 0.885)
     bh = bw
     bx = int((w - bw) / 2)
-    
-    # Y座標：上部UIの下、画面全体の31.2%〜31.5%の位置が盤面領域の上端
-    # いくつかのわずかなオフセット位置を試行して認識失敗を防止
     y_offsets = [int(h * 0.313), int(h * 0.310), int(h * 0.316), int(h * 0.305), int(h * 0.320)]
 
     for by in y_offsets:
-        # 9x9 または 10x10 の両方でパズル解決を試みる
         for N in [9, 10]:
             cell_w = bw / N
             cell_h = bh / N
@@ -125,7 +166,6 @@ def process_puzzle_image(image_bytes):
                 for c in range(N):
                     cx = int(bx + (c + 0.5) * cell_w)
                     cy = int(by + (r + 0.5) * cell_h)
-                    # セル中心部 7x7 ピクセルの平均RGBを取得
                     patch = img_np[max(0, cy-3):min(h, cy+4), max(0, cx-3):min(w, cx+4)]
                     mean_rgb = patch.mean(axis=(0, 1))
                     row_samples.append(mean_rgb)
@@ -137,18 +177,18 @@ def process_puzzle_image(image_bytes):
 
             solution = solve_meowdoku(labels)
             if solution is not None:
-                # 解が見つかったら描画
                 draw = ImageDraw.Draw(img)
                 cat_coords = []
+                coords_param_list = []
                 for r in range(N):
                     for c in range(N):
                         if solution[r][c] == 1:
                             cat_coords.append((r + 1, c + 1))
+                            coords_param_list.append(f"{r+1}_{c+1}")
                             cx = bx + (c + 0.5) * cell_w
                             cy = by + (r + 0.5) * cell_h
                             rad = min(cell_w, cell_h) * 0.38
                             
-                            # 赤色の二重丸を描画
                             draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=7)
                             draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="red")
 
@@ -157,8 +197,13 @@ def process_puzzle_image(image_bytes):
                 img.save(out_buffer, format="JPEG", quality=85)
                 out_bytes = out_buffer.getvalue()
 
-                # Imgur にアップロードして公開URLを取得
+                # 優先1: Imgur 公開アップロード
                 public_image_url = upload_to_imgur(out_bytes)
+
+                # 優先2: 万が一Imgurがタイムアウト・エラーの場合の自前動的画像URL
+                if not public_image_url:
+                    cats_str = ",".join(coords_param_list)
+                    public_image_url = f"{host_url}/render_solution?cats={cats_str}&N={N}"
 
                 return solution, cat_coords, public_image_url
 
@@ -166,7 +211,7 @@ def process_puzzle_image(image_bytes):
 
 
 # ==========================================
-# 3. Webhook エンドポイント
+# 4. Webhook エンドポイント
 # ==========================================
 @app.route("/", methods=['GET'])
 def index():
@@ -184,11 +229,13 @@ def callback():
 
 
 # ==========================================
-# 4. LINE メッセージ処理
+# 5. LINE メッセージ処理
 # ==========================================
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
     message_id = event.message.id
+    # リクエスト元のホスト名を取得 (例: https://meowdoku-bot.vercel.app)
+    host_url = request.host_url.rstrip('/')
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -196,7 +243,7 @@ def handle_image_message(event):
 
         try:
             image_bytes = line_bot_blob_api.get_message_content(message_id=message_id)
-            solution, cat_coords, image_url = process_puzzle_image(image_bytes)
+            solution, cat_coords, image_url = process_puzzle_image(image_bytes, host_url)
 
             messages = []
 
@@ -205,7 +252,7 @@ def handle_image_message(event):
             coord_text += "\n".join([f"・{r}行目 - {c}列目" for r, c in cat_coords])
             messages.append(TextMessage(text=coord_text))
 
-            # 2. 画像メッセージ (公開URL)
+            # 2. 画像メッセージ (確実に画像URLをセット)
             if image_url:
                 messages.append(ImageMessage(
                     original_content_url=image_url,

@@ -6,7 +6,7 @@ import base64
 import requests
 import numpy as np
 from PIL import Image, ImageDraw
-from flask import Flask, request, abort, send_file, render_template_string
+from flask import Flask, request, abort, send_file
 from sklearn.cluster import KMeans
 
 # LINE SDK v3 Imports
@@ -80,58 +80,85 @@ def solve_meowdoku(grid):
     return None
 
 
-# Imgur への無料画像アップロード関数
-def upload_to_imgur(image_bytes):
+# 無料画像ホスティングへのアップロード（Multiple Services Fallback）
+def upload_image_to_cloud(image_bytes):
+    # 1. Catbox.moe / ImgBB 無料無制限アップロード
+    try:
+        url = "https://catbox.moe/user/api.php"
+        files = {'fileToUpload': ('solution.jpg', image_bytes, 'image/jpeg')}
+        data = {'reqtype': 'fileupload'}
+        res = requests.post(url, files=files, data=data, timeout=6)
+        if res.status_code == 200 and res.text.startswith("http"):
+            return res.text.strip()
+    except Exception as e:
+        logging.error(f"Catbox upload failed: {e}")
+
+    # 2. Imgur 無料アップロード
     try:
         url = "https://api.imgur.com/3/image"
         headers = {"Authorization": "Client-ID 5442646d79e5d9c"}
         payload = {'image': base64.b64encode(image_bytes).decode('utf-8')}
-        res = requests.post(url, headers=headers, data=payload, timeout=5)
+        res = requests.post(url, headers=headers, data=payload, timeout=6)
         data = res.json()
         if data.get('success'):
             return data['data']['link']
     except Exception as e:
         logging.error(f"Imgur upload failed: {e}")
+
     return None
 
 
 # ==========================================
-# 2. オンデマンド画像生成 (LINE画像配信用)
+# 2. オンデマンド・フルカラー盤面描画
 # ==========================================
 @app.route("/render_solution")
 def render_solution():
     """
-    外部画像アップロードが失敗した場合でも、確実にLINEへ画像を返すためのオンデマンド描画ルート
+    元のゲーム画面の色付け（カラフルなマス目）を忠実に再現したパズル解答画像を生成
     """
     try:
         cats_param = request.args.get("cats", "")
+        colors_param = request.args.get("colors", "")
         N = int(request.args.get("N", 9))
         
-        coords = [tuple(map(int, p.split("_"))) for p in cats_param.split(",") if p]
+        coords = set(tuple(map(int, p.split("_"))) for p in cats_param.split(",") if p)
+        color_list = [list(map(int, c.split("_"))) for c in colors_param.split("-") if c]
         
-        # 600x600 のシンプルな解答ボード画像を動的作成
-        img_size = 600
-        img = Image.new("RGB", (img_size, img_size), "#F8F4F0")
+        img_size = 640
+        padding = 20
+        board_size = img_size - padding * 2
+        cell_size = board_size / N
+        
+        img = Image.new("RGB", (img_size, img_size), "#F7F4EF")
         draw = ImageDraw.Draw(img)
         
-        cell_size = img_size / N
-        
-        # 枠線の描画
-        for i in range(N + 1):
-            draw.line([(i * cell_size, 0), (i * cell_size, img_size)], fill="#D0C8B8", width=2)
-            draw.line([(0, i * cell_size), (img_size, i * cell_size)], fill="#D0C8B8", width=2)
-            
-        # ネコ（赤丸）の位置を描画
+        # 1. 各マスのカラフルな色ブロックを角丸で描画
+        for r in range(N):
+            for c in range(N):
+                idx = r * N + c
+                if idx < len(color_list):
+                    rgb = tuple(color_list[idx])
+                else:
+                    rgb = (200, 200, 200)
+                    
+                x1 = padding + c * cell_size + 2
+                y1 = padding + r * cell_size + 2
+                x2 = padding + (c + 1) * cell_size - 2
+                y2 = padding + (r + 1) * cell_size - 2
+                
+                # カラフルな角丸ブロック描画
+                draw.rounded_rectangle([x1, y1, x2, y2], radius=6, fill=rgb)
+                
+        # 2. 赤丸（ネコの位置）の描画
         for r, c in coords:
-            # 1-indexed to 0-indexed
             r_idx = r - 1
             c_idx = c - 1
-            cx = (c_idx + 0.5) * cell_size
-            cy = (r_idx + 0.5) * cell_size
-            rad = cell_size * 0.35
+            cx = padding + (c_idx + 0.5) * cell_size
+            cy = padding + (r_idx + 0.5) * cell_size
+            rad = cell_size * 0.36
             
-            draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=6)
-            draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="red")
+            draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=7)
+            draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="#E60012")
             
         out_buf = io.BytesIO()
         img.save(out_buf, "JPEG", quality=90)
@@ -177,11 +204,22 @@ def process_puzzle_image(image_bytes, host_url):
 
             solution = solve_meowdoku(labels)
             if solution is not None:
+                # 代表色マッピングの取得
+                cluster_colors = {}
+                for k in range(N):
+                    cluster_colors[k] = kmeans.cluster_centers_[k].astype(int)
+
+                cell_rgb_strings = []
                 draw = ImageDraw.Draw(img)
                 cat_coords = []
                 coords_param_list = []
+                
                 for r in range(N):
                     for c in range(N):
+                        label_id = labels[r][c]
+                        rgb = cluster_colors[label_id]
+                        cell_rgb_strings.append(f"{rgb[0]}_{rgb[1]}_{rgb[2]}")
+
                         if solution[r][c] == 1:
                             cat_coords.append((r + 1, c + 1))
                             coords_param_list.append(f"{r+1}_{c+1}")
@@ -192,18 +230,19 @@ def process_puzzle_image(image_bytes, host_url):
                             draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="red", width=7)
                             draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="red")
 
-                # 画像をバイト列に変換
+                # 元画像ベースの描画保存
                 out_buffer = io.BytesIO()
                 img.save(out_buffer, format="JPEG", quality=85)
                 out_bytes = out_buffer.getvalue()
 
-                # 優先1: Imgur 公開アップロード
-                public_image_url = upload_to_imgur(out_bytes)
+                # 高速クラウドアップロード（Catbox/Imgur）
+                public_image_url = upload_image_to_cloud(out_bytes)
 
-                # 優先2: 万が一Imgurがタイムアウト・エラーの場合の自前動的画像URL
+                # アップロード失敗時の自前フルカラーパズル描画フォールバック
                 if not public_image_url:
                     cats_str = ",".join(coords_param_list)
-                    public_image_url = f"{host_url}/render_solution?cats={cats_str}&N={N}"
+                    colors_str = "-".join(cell_rgb_strings)
+                    public_image_url = f"{host_url}/render_solution?cats={cats_str}&colors={colors_str}&N={N}"
 
                 return solution, cat_coords, public_image_url
 
@@ -234,7 +273,6 @@ def callback():
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
     message_id = event.message.id
-    # リクエスト元のホスト名を取得 (例: https://meowdoku-bot.vercel.app)
     host_url = request.host_url.rstrip('/')
 
     with ApiClient(configuration) as api_client:
@@ -247,12 +285,10 @@ def handle_image_message(event):
 
             messages = []
 
-            # 1. テキスト形式のネコの位置情報
             coord_text = "🐱 ネコの位置（上から何行目 - 左から何列目）：\n"
             coord_text += "\n".join([f"・{r}行目 - {c}列目" for r, c in cat_coords])
             messages.append(TextMessage(text=coord_text))
 
-            # 2. 画像メッセージ (確実に画像URLをセット)
             if image_url:
                 messages.append(ImageMessage(
                     original_content_url=image_url,

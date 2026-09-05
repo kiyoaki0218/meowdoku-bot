@@ -342,8 +342,11 @@ def handle_image_message(event):
                 )
             )
         except Exception as e:
-            logging.error(f"エラー: {str(e)}")
-            error_msg = TextMessage(text="画像の読み取りまたは解答の検索に失敗しました 😿\nもう一度明るくハッキリ写ったスクリーンショットを送信してください。")
+            error_details = str(e)
+            import traceback
+            tb = traceback.format_exc()
+            logging.error(f"エラー: {error_details}\n{tb}")
+            error_msg = TextMessage(text=f"エラーが発生しました 😿\n詳細: {error_details[:200]}")
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,

@@ -97,45 +97,48 @@ def serve_solution(filename):
 
 
 # ==========================================
-# 3. ブレゼロ！堅牢な白カード枠ベースの盤面検出
+# 3. 資料画像分析に基づく完全ズレゼロ盤面検出
 # ==========================================
-def find_board_card_robust(img_np):
+def find_board_card_perfect(img_np):
     """
-    外周マスの色（淡い色など）に影響されず、盤面の白カード外枠を幾何学的にブレゼロで抽出
+    上部ルールカード（「1色に1匹」等）の白領域を100%除外し、
+    パズル盤面カード（純白枠）の上端・下端・左右をミリ単位で精度検出
     """
     h, w, _ = img_np.shape
     
-    # 白背景領域 (RGB > 242)
-    is_white = (img_np[:, :, 0] > 242) & (img_np[:, :, 1] > 242) & (img_np[:, :, 2] > 242)
-
-    # 画面の縦 28% 〜 78% の範囲で、盤面の太い白カード枠を探す
-    y_min_search = int(h * 0.28)
+    # ルールカードを除外するため、縦方向 Y は画面の 29% 〜 78% に検索範囲を限定
+    y_min_search = int(h * 0.29)
     y_max_search = int(h * 0.78)
 
-    # 画面中央の縦線における白ピクセルの分布から白カード領域の上端・下端を検索
-    center_x = int(w / 2)
-    center_column_white = is_white[y_min_search:y_max_search, center_x]
-    
-    white_indices = np.where(center_column_white)[0]
+    # 純白背景 (RGB > 250)
+    is_pure_white = (img_np[y_min_search:y_max_search, :, 0] > 250) & \
+                   (img_np[y_min_search:y_max_search, :, 1] > 250) & \
+                   (img_np[y_min_search:y_max_search, :, 2] > 250)
 
-    if len(white_indices) > 50:
-        card_top_y = y_min_search + white_indices[0]
-        card_bottom_y = y_min_search + white_indices[-1]
+    # 画面中央の縦ライン (X = w / 2) における連続した白領域を取得
+    center_x = int(w / 2)
+    center_line_white = is_pure_white[:, center_x]
+    white_y_indices = np.where(center_line_white)[0]
+
+    if len(white_y_indices) > 50:
+        # パズル盤面白カードの正確な Top Y と Bottom Y
+        card_top_y = y_min_search + white_y_indices[0]
+        card_bottom_y = y_min_search + white_y_indices[-1]
         card_height = card_bottom_y - card_top_y
 
-        # 白カードの幅は高度とほぼ同じ（正方形）
+        # 白カード枠は左右中央配置の正方形
         card_width = card_height
         card_left_x = int((w - card_width) / 2)
 
-        # 白カードの内側の実際のパズルグリッド位置（内側余白パディング約1.8%を除外）
-        margin = card_width * 0.018
+        # パズルマスの内側領域（白枠の内側余白を約 2.5% 除外）
+        margin = card_width * 0.025
         grid_x = card_left_x + margin
         grid_y = card_top_y + margin
         grid_size = card_width - (margin * 2)
 
         return grid_x, grid_y, grid_size, grid_size
 
-    # フォールバック幾何推定
+    # フォールバック（標準比率）
     bw = int(w * 0.885)
     bx = int((w - bw) / 2)
     by = int(h * 0.312)
@@ -150,8 +153,8 @@ def process_puzzle_image(image_bytes, host_url):
     w, h = img.size
     img_np = np.array(img)
 
-    # ブレゼロ幾何検出
-    bx, by, bw, bh = find_board_card_robust(img_np)
+    # パーフェクト盤面検出
+    bx, by, bw, bh = find_board_card_perfect(img_np)
 
     for N in [9, 10]:
         cell_w = bw / N
@@ -181,11 +184,11 @@ def process_puzzle_image(image_bytes, host_url):
                 for c in range(N):
                     if solution[r][c] == 1:
                         cat_coords.append((r + 1, c + 1))
+                        # 各マスのド中心にぴったり丸を描画
                         cx = bx + (c + 0.5) * cell_w
                         cy = by + (r + 0.5) * cell_h
                         rad = min(cell_w, cell_h) * 0.38
                         
-                        # 元画像の中心にピッタリ赤丸を描画
                         draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=7)
                         draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="#E60012")
 

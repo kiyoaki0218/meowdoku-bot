@@ -82,7 +82,7 @@ def solve_meowdoku(grid):
 
 
 # ==========================================
-# 2. PC版LINE 100%表示対応・静的画像配信ルート
+# 2. PC版LINE 表示対応・静的画像配信ルート
 # ==========================================
 @app.route('/solution/<filename>')
 def serve_solution(filename):
@@ -97,34 +97,45 @@ def serve_solution(filename):
 
 
 # ==========================================
-# 3. カラフルセル・ダイレクト外挿（ズレゼロ検出・元画像用）
+# 3. ブレゼロ！堅牢な白カード枠ベースの盤面検出
 # ==========================================
-def find_board_color_bounding(img_np):
+def find_board_card_robust(img_np):
+    """
+    外周マスの色（淡い色など）に影響されず、盤面の白カード外枠を幾何学的にブレゼロで抽出
+    """
     h, w, _ = img_np.shape
-    y_start = int(h * 0.25)
-    y_end = int(h * 0.80)
-    sub_img = img_np[y_start:y_end, :, :]
     
-    r = sub_img[..., 0].astype(int)
-    g = sub_img[..., 1].astype(int)
-    b = sub_img[..., 2].astype(int)
+    # 白背景領域 (RGB > 242)
+    is_white = (img_np[:, :, 0] > 242) & (img_np[:, :, 1] > 242) & (img_np[:, :, 2] > 242)
+
+    # 画面の縦 28% 〜 78% の範囲で、盤面の太い白カード枠を探す
+    y_min_search = int(h * 0.28)
+    y_max_search = int(h * 0.78)
+
+    # 画面中央の縦線における白ピクセルの分布から白カード領域の上端・下端を検索
+    center_x = int(w / 2)
+    center_column_white = is_white[y_min_search:y_max_search, center_x]
     
-    color_diff = np.maximum(np.maximum(np.abs(r - g), np.abs(g - b)), np.abs(b - r))
-    is_colored = color_diff > 30
+    white_indices = np.where(center_column_white)[0]
 
-    y_indices, x_indices = np.where(is_colored)
+    if len(white_indices) > 50:
+        card_top_y = y_min_search + white_indices[0]
+        card_bottom_y = y_min_search + white_indices[-1]
+        card_height = card_bottom_y - card_top_y
 
-    if len(y_indices) > 50 and len(x_indices) > 50:
-        min_x = np.min(x_indices)
-        max_x = np.max(x_indices)
-        min_y = y_start + np.min(y_indices)
-        max_y = y_start + np.max(y_indices)
+        # 白カードの幅は高度とほぼ同じ（正方形）
+        card_width = card_height
+        card_left_x = int((w - card_width) / 2)
 
-        bw = max_x - min_x
-        bh = max_y - min_y
+        # 白カードの内側の実際のパズルグリッド位置（内側余白パディング約1.8%を除外）
+        margin = card_width * 0.018
+        grid_x = card_left_x + margin
+        grid_y = card_top_y + margin
+        grid_size = card_width - (margin * 2)
 
-        return min_x, min_y, bw, bh
+        return grid_x, grid_y, grid_size, grid_size
 
+    # フォールバック幾何推定
     bw = int(w * 0.885)
     bx = int((w - bw) / 2)
     by = int(h * 0.312)
@@ -132,15 +143,15 @@ def find_board_color_bounding(img_np):
 
 
 # ==========================================
-# 4. 元画像高精度解析 (リサイズ無しの完全元の精度)
+# 4. 元画像高精度解析 & オーバーレイ
 # ==========================================
 def process_puzzle_image(image_bytes, host_url):
-    # 元画像の解像度を 100% 保持（リサイズなしでズレを防止）
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
     img_np = np.array(img)
 
-    bx, by, bw, bh = find_board_color_bounding(img_np)
+    # ブレゼロ幾何検出
+    bx, by, bw, bh = find_board_card_robust(img_np)
 
     for N in [9, 10]:
         cell_w = bw / N
@@ -174,7 +185,7 @@ def process_puzzle_image(image_bytes, host_url):
                         cy = by + (r + 0.5) * cell_h
                         rad = min(cell_w, cell_h) * 0.38
                         
-                        # 元画像のオリジナル高画質上にピタッと赤丸を描画
+                        # 元画像の中心にピッタリ赤丸を描画
                         draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=7)
                         draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="#E60012")
 

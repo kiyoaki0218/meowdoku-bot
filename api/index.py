@@ -83,7 +83,7 @@ def solve_meowdoku(grid):
     return None
 
 
-# 無料画像ホスティングへの多重アタック（確実に画像URLを取得）
+# 無料画像ホスティングへの多重アタック
 def upload_image_to_cloud(image_bytes):
     unique_name = f"sol_{uuid.uuid4().hex[:10]}.jpg"
     
@@ -129,9 +129,6 @@ def upload_image_to_cloud(image_bytes):
     return None
 
 
-# ==========================================
-# 2. Vercelローカル静的画像配信ルート
-# ==========================================
 @app.route('/solution/<filename>')
 def serve_solution(filename):
     file_path = os.path.join(TMP_DIR, filename)
@@ -141,42 +138,41 @@ def serve_solution(filename):
 
 
 # ==========================================
-# 3. 精密な白枠ベースの盤面位置検出
+# 2. カラフルセル・ダイレクト外挿（ズレゼロ検出）
 # ==========================================
-def find_board_precise(img_np):
+def find_board_color_bounding(img_np):
+    """
+    上部ルールカードや背景白に惑わされず、カラフルなパズルマスの外周を直接ピクセル検出
+    """
     h, w, _ = img_np.shape
-    y_start = int(h * 0.20)
-    y_end = int(h * 0.85)
     
-    is_white = (img_np[y_start:y_end, :, 0] > 240) & \
-               (img_np[y_start:y_end, :, 1] > 240) & \
-               (img_np[y_start:y_end, :, 2] > 240)
-               
-    row_counts = is_white.sum(axis=1)
-    col_counts = is_white.sum(axis=0)
+    # 検索範囲：画面の25%〜80%
+    y_start = int(h * 0.25)
+    y_end = int(h * 0.80)
+    sub_img = img_np[y_start:y_end, :, :]
     
-    valid_rows = np.where(row_counts > w * 0.7)[0]
-    valid_cols = np.where(col_counts > (y_end - y_start) * 0.4)[0]
+    r = sub_img[..., 0].astype(int)
+    g = sub_img[..., 1].astype(int)
+    b = sub_img[..., 2].astype(int)
     
-    if len(valid_rows) > 0 and len(valid_cols) > 0:
-        by1 = y_start + valid_rows[0]
-        by2 = y_start + valid_rows[-1]
-        bx1 = valid_cols[0]
-        bx2 = valid_cols[-1]
-        
-        bw = bx2 - bx1
-        bh = by2 - by1
-        
-        margin_x = int(bw * 0.025)
-        margin_y = int(bh * 0.025)
-        
-        grid_x = bx1 + margin_x
-        grid_y = by1 + margin_y
-        grid_w = bw - (margin_x * 2)
-        grid_h = bh - (margin_y * 2)
-        
-        return grid_x, grid_y, grid_w, grid_h
+    # 彩度判定（RGBの最大と最小の差が30以上の有彩色ピクセル）
+    color_diff = np.maximum(np.maximum(np.abs(r - g), np.abs(g - b)), np.abs(b - r))
+    is_colored = color_diff > 30
 
+    y_indices, x_indices = np.where(is_colored)
+
+    if len(y_indices) > 50 and len(x_indices) > 50:
+        min_x = np.min(x_indices)
+        max_x = np.max(x_indices)
+        min_y = y_start + np.min(y_indices)
+        max_y = y_start + np.max(y_indices)
+
+        bw = max_x - min_x
+        bh = max_y - min_y
+
+        return min_x, min_y, bw, bh
+
+    # バックアップ用
     bw = int(w * 0.885)
     bx = int((w - bw) / 2)
     by = int(h * 0.312)
@@ -184,14 +180,14 @@ def find_board_precise(img_np):
 
 
 # ==========================================
-# 4. 画像解析 (元のスクリーンショットへの直接描画)
+# 3. 画像解析 (元画像オーバーレイ)
 # ==========================================
 def process_puzzle_image(image_bytes, host_url):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
     img_np = np.array(img)
 
-    bx, by, bw, bh = find_board_precise(img_np)
+    bx, by, bw, bh = find_board_color_bounding(img_np)
 
     for N in [9, 10]:
         cell_w = bw / N
@@ -221,10 +217,12 @@ def process_puzzle_image(image_bytes, host_url):
                 for c in range(N):
                     if solution[r][c] == 1:
                         cat_coords.append((r + 1, c + 1))
+                        # マス目の中心座標を正確に計算
                         cx = bx + (c + 0.5) * cell_w
                         cy = by + (r + 0.5) * cell_h
                         rad = min(cell_w, cell_h) * 0.38
                         
+                        # 元画像上の該当マスの中央にピッタリ赤丸を描画
                         draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], outline="#E60012", width=7)
                         draw.ellipse([cx - rad*0.35, cy - rad*0.35, cx + rad*0.35, cy + rad*0.35], fill="#E60012")
 
@@ -232,10 +230,8 @@ def process_puzzle_image(image_bytes, host_url):
             img.save(out_buffer, format="JPEG", quality=90)
             out_bytes = out_buffer.getvalue()
 
-            # 1. 外部クラウドへ保存を試みる
             public_image_url = upload_image_to_cloud(out_bytes)
 
-            # 2. クラウド全滅時のVercel直接配信フォールバック
             filename = f"sol_{uuid.uuid4().hex}.jpg"
             local_save_path = os.path.join(TMP_DIR, filename)
             with open(local_save_path, "wb") as f:
@@ -256,7 +252,7 @@ def process_puzzle_image(image_bytes, host_url):
 
 
 # ==========================================
-# 5. Webhook エンドポイント
+# 4. Webhook エンドポイント
 # ==========================================
 @app.route("/", methods=['GET'])
 def index():
@@ -274,7 +270,7 @@ def callback():
 
 
 # ==========================================
-# 6. LINE メッセージ処理
+# 5. LINE メッセージ処理
 # ==========================================
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
